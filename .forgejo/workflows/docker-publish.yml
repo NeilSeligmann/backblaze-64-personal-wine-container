@@ -1,0 +1,469 @@
+# Forgejo port of .github/workflows/docker-publish.yml. Forgejo reads
+# .forgejo/workflows when it exists and then ignores .github/workflows, so the
+# GitHub file stays as upstream wrote it and merges from upstream stay clean.
+#
+# Differences from the GitHub file, all forced by Forgejo's runner:
+# - Images go to this Forgejo instance's registry (host taken from
+#   GITHUB_SERVER_URL), not ghcr.io.
+# - Login uses the REGISTRY_USERNAME and REGISTRY_TOKEN secrets. The injected
+#   token has no package-write scope, because the runner ignores `permissions:`.
+#   REGISTRY_TOKEN needs write:package.
+# - Actions are named by full URL, because the default action source here is not
+#   github.com.
+# - Buildx uses the runner's Docker daemon (driver: docker) and the cache is
+#   inline in the pushed image, in place of actions/cache and a local
+#   BuildKit cache.
+# - Tags are worked out in shell, not with docker/metadata-action.
+name: Docker Build and Push
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  schedule:
+    # Weekly, Mondays at 04:23 UTC, for the beta.
+    - cron: '23 4 * * 1'
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+    paths-ignore:
+      - README.md
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  # Lower-cased in the steps that use it, since a registry path must be.
+  IMAGE_NAME: ${{ github.repository_owner }}/backblaze-personal-wine
+
+jobs:
+  # Everything that can be checked without building an image. See the GitHub
+  # workflow for why this gates the builds.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: https://github.com/actions/checkout@v4
+        with:
+          # Full history: test-switches.sh checks that patches/promoted's
+          # PATCHES_FROM names a commit, which may be an older one.
+          fetch-depth: 0
+
+      # The suites need the same Python as the image (3.12). The runner's image
+      # may carry an older one, so install it rather than rely on it.
+      - name: Set up Python 3.12
+        uses: https://github.com/actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check the runner has what the suites need
+        run: |
+          set -eu
+          python3 -c 'import sys; assert sys.version_info >= (3, 12), sys.version'
+          python3 --version
+          command -v node >/dev/null || { echo "node is not on PATH; the parse gate needs it for node --check" >&2; exit 1; }
+          node --version
+
+      - name: Parse every script in both rootfs trees
+        run: sh tests/test-parse.sh
+      - name: Test the diagnostic bundle sanitiser
+        run: python3 tests/test-sanitiser.py
+      - name: Test stall detection fails safe
+        run: bash tests/test-health.sh
+      - name: Test the doctor's lock repair gate
+        run: bash tests/test-doctor.sh
+      - name: Test the watchdog starts a service that stays down
+        run: bash tests/test-watchdog.sh
+      - name: Test the Wine patch switches and their interlocks
+        run: bash tests/test-switches.sh
+      - name: Test the web interface, API and notifications
+        run: python3 tests/test-beta.py
+
+  build:
+    needs: tests
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    strategy:
+      matrix:
+        # ubuntu24 is the default (oldest supported LTS) and owns the shared
+        # :latest/:main/version tags. ubuntu26 ships as :ubuntu26.
+        dockerfile: [ubuntu24, ubuntu26]
+
+    steps:
+      - name: Checkout repository
+        uses: https://github.com/actions/checkout@v4
+
+      - name: Work out the registry and tags
+        id: m
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          VARIANT: ${{ matrix.dockerfile }}
+        run: |
+          set -eu
+          host="${GITHUB_SERVER_URL#https://}"; host="${host#http://}"; host="${host%%/*}"
+          test -n "$host"
+          img="$(printf '%s/%s' "$host" "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          tags="$img:$VARIANT"
+          ver=""
+          case "$REF" in refs/tags/v*) ver="${REF#refs/tags/}" ;; esac
+          if [ -n "$ver" ]; then
+            if [ "$VARIANT" = ubuntu24 ]; then
+              tags="$tags,$img:$ver,$img:latest"
+            else
+              tags="$tags,$img:${ver}-$VARIANT"
+            fi
+          elif [ "$REF" = refs/heads/main ] && [ "$VARIANT" = ubuntu24 ]; then
+            tags="$tags,$img:main"
+          fi
+          echo "host=$host" >> "$GITHUB_OUTPUT"
+          echo "image=$img" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "version=${ver:-$VARIANT}" >> "$GITHUB_OUTPUT"
+          # Reading the cache from a private registry needs the login, which a
+          # pull request does not get.
+          if [ "$EVENT" != pull_request ]; then
+            echo "cache_from=type=registry,ref=$img:$VARIANT" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tags: $tags"
+
+      # Signed in, base image pulls count against this account, not the
+      # runner's address. A failed sign-in falls back to anonymous pulls.
+      - name: Log into Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Log into the Forgejo container registry
+        if: github.event_name != 'pull_request'
+        env:
+          HOST: ${{ steps.m.outputs.host }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          : "${REGISTRY_USERNAME:?Set the REGISTRY_USERNAME Actions secret}"
+          : "${REGISTRY_TOKEN:?Set the REGISTRY_TOKEN Actions secret with write:package access}"
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$HOST" -u "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Setup Docker buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      # Built locally first so it can be started and checked before any push.
+      - name: Build Docker image for testing
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.${{ matrix.dockerfile }}
+          build-args: |
+            BUILD_REV=${{ github.sha }}
+            BUILD_NUMBER=${{ github.run_number }}
+          load: true
+          tags: bb-smoketest:${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          cache-from: ${{ steps.m.outputs.cache_from }}
+          provenance: false
+
+      - name: Smoke test the built image
+        run: ./.github/smoke-test.sh bb-smoketest:${{ matrix.dockerfile }}
+
+      # The stable images must never carry the beta's patched Wine.
+      - name: Assert the stable image carries unpatched Wine
+        run: |
+          set -eu
+          docker run --rm --entrypoint sh bb-smoketest:${{ matrix.dockerfile }} -c '
+            ws="$(readlink -f "$(command -v wineserver)")"
+            if grep -qa sock_stream_send_ready "$ws"; then
+              echo "FAIL: $ws contains the beta Wine patch; it must stay beta-only" >&2
+              exit 1
+            fi
+            echo "OK: $ws is unpatched"
+          '
+
+      # Push only once the smoke test has passed, and never on a pull request.
+      # The layers are in the daemon from the test build, so this reassembles.
+      - name: Build and push Docker image
+        if: github.event_name != 'pull_request'
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.${{ matrix.dockerfile }}
+          build-args: |
+            DOCKER_IMAGE_VERSION=${{ steps.m.outputs.version }}
+            BUILD_REV=${{ github.sha }}
+            BUILD_NUMBER=${{ github.run_number }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.m.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: ${{ steps.m.outputs.cache_from }}
+          cache-to: type=inline
+          provenance: false
+
+  # The beta image: Wine built from source with the patches. Weekly and on
+  # demand only, because compiling Wine is slow. Publishes :beta and nothing else.
+  beta:
+    needs: tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Checkout repository
+        uses: https://github.com/actions/checkout@v4
+
+      - name: Work out the registry
+        id: m
+        run: |
+          set -eu
+          host="${GITHUB_SERVER_URL#https://}"; host="${host#http://}"; host="${host%%/*}"
+          test -n "$host"
+          img="$(printf '%s/%s' "$host" "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          echo "host=$host" >> "$GITHUB_OUTPUT"
+          echo "image=$img" >> "$GITHUB_OUTPUT"
+
+      - name: Log into Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Log into the Forgejo container registry
+        env:
+          HOST: ${{ steps.m.outputs.host }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          : "${REGISTRY_USERNAME:?Set the REGISTRY_USERNAME Actions secret}"
+          : "${REGISTRY_TOKEN:?Set the REGISTRY_TOKEN Actions secret with write:package access}"
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$HOST" -u "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Setup Docker buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Build the beta image
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.beta
+          build-args: |
+            DOCKER_IMAGE_VERSION=beta
+            BUILD_REV=${{ github.sha }}
+            BUILD_NUMBER=${{ github.run_number }}
+          load: true
+          tags: bb-beta-test:local
+          platforms: linux/amd64
+          cache-from: type=registry,ref=${{ steps.m.outputs.image }}:beta
+          provenance: false
+
+      - name: Smoke test the beta image
+        run: ./.github/smoke-test.sh bb-beta-test:local
+
+      - name: Check the beta carries the patched Wine
+        run: |
+          set -eux
+          docker run --rm --entrypoint /opt/wine/bin/wine bb-beta-test:local --version
+          docker run --rm --entrypoint sh bb-beta-test:local -c 'grep -q "^variant=beta" /etc/bb-build'
+          docker run --rm --entrypoint sh bb-beta-test:local -c \
+            'grep -ac sock_stream_send_ready /opt/wine/bin/wineserver | grep -qv "^0$"'
+          docker run --rm --entrypoint sh bb-beta-test:local -c '
+            set -eux
+            grep -q "^applied wine-writability-fix switch" /opt/wine/share/bb64-patches
+            grep -aq WINE_SOCK_SEND_READY /opt/wine/bin/wineserver
+            grep -q "^applied wine-heap-lfh-reuse switch" /opt/wine/share/bb64-patches
+            grep -aq WINE_HEAP_LFH_REUSE /opt/wine/lib/wine/x86_64-unix/ntdll.so \
+              || { echo "WINE_HEAP_LFH_REUSE is not in ntdll.so" >&2; exit 1; }
+            for v in WINE_SOCK_SEND_READY WINE_SOCK_FDWRITE_REARM WINE_SERVICE_TOKEN WINE_OFD_LOCKS WINE_CASE_CACHE WINE_HEAP_LFH_REUSE; do
+              eval "test \"\${$v:-}\" = 1" || { echo "beta default $v is not 1" >&2; exit 1; }
+            done
+          '
+          docker run --rm --entrypoint sh bb-beta-test:local -c '
+            set -eux
+            command -v setpriv >/dev/null
+            sh -n /usr/local/bin/bb-doctor
+            for part in asuser skipped drives config passes; do
+              grep -q "bb-doctor-$part.sh" /usr/local/bin/bb-doctor
+              sh -n "/usr/local/lib/bb-doctor-$part.sh"
+            done
+            grep -q "swap to absorb the peaks" /usr/local/bin/bb-doctor
+            sh -n /usr/local/bin/bb-health
+            grep -q FROZEN /usr/local/bin/bb-health
+            bash -n /startapp.sh
+            grep -q BACKBLAZE_VERSION /startapp.sh
+          '
+
+      - name: Show what the beta image holds, when its check fails
+        if: failure()
+        run: |
+          docker run --rm --entrypoint sh bb-beta-test:local -c '
+            cat /etc/bb-build; ls -la /opt/wine /opt/wine/share
+            cat /opt/wine/share/bb64-patches
+            ls -la /opt/wine/bin/wineserver /opt/wine/lib/wine/x86_64-unix/ntdll.so
+            grep -ac sock_stream_send_ready /opt/wine/bin/wineserver
+          ' || true
+
+      - name: Push the beta image
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.beta
+          build-args: |
+            DOCKER_IMAGE_VERSION=beta
+            BUILD_REV=${{ github.sha }}
+            BUILD_NUMBER=${{ github.run_number }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.m.outputs.image }}:beta
+          cache-from: type=registry,ref=${{ steps.m.outputs.image }}:beta
+          cache-to: type=inline
+          provenance: false
+
+  # :latest-patched. The stable container on the fork's Wine, pinned by
+  # patches/promoted. Publishes on release tags only. Run by hand, it builds and
+  # tests without publishing.
+  patched:
+    needs: tests
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Checkout repository
+        uses: https://github.com/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The pin is read as data, never sourced, and each value is checked before
+      # it reaches git or the build.
+      - name: Use the promoted Wine and patch set
+        id: pin
+        run: |
+          set -eu
+          ref="$(sed -n 's/^WINE_REF=//p' patches/promoted | head -1)"
+          from="$(sed -n 's/^PATCHES_FROM=//p' patches/promoted | head -1)"
+          printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9._/-]+$' || { echo "patches/promoted: bad WINE_REF '$ref'" >&2; exit 1; }
+          printf '%s' "$from" | grep -Eq '^[A-Za-z0-9._/-]+$' || { echo "patches/promoted: bad PATCHES_FROM '$from'" >&2; exit 1; }
+          if [ "$from" != this ]; then
+            git rev-parse --verify --quiet "${from}^{commit}" >/dev/null \
+              || { echo "patches/promoted: PATCHES_FROM=$from is not a tag or commit here" >&2; exit 1; }
+            rm -rf patches
+            git checkout "$from" -- patches
+            echo "patches/ taken from $from"
+          fi
+          echo "Building :latest-patched from Wine $ref"
+          echo "wine_ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Log into Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      # The guard fails the job rather than let a tag without the -patched
+      # suffix overwrite a WineHQ tag.
+      - name: Work out the tags
+        id: tags
+        run: |
+          set -eu
+          host="${GITHUB_SERVER_URL#https://}"; host="${host#http://}"; host="${host%%/*}"
+          test -n "$host"
+          img="$(printf '%s/%s' "$host" "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            ver="${GITHUB_REF#refs/tags/}"
+            tags="$img:latest-patched,$img:${ver}-patched"
+          else
+            # Run by hand: built and tested, never published.
+            ver="dev"
+            tags=""
+          fi
+          for t in $(echo "$tags" | tr ',' ' '); do
+            case "$t" in *-patched) ;; *) echo "refusing to publish $t: not a -patched tag" >&2; exit 1 ;; esac
+          done
+          echo "host=$host" >> "$GITHUB_OUTPUT"
+          echo "image=$img" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Log into the Forgejo container registry
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          HOST: ${{ steps.tags.outputs.host }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          : "${REGISTRY_USERNAME:?Set the REGISTRY_USERNAME Actions secret}"
+          : "${REGISTRY_TOKEN:?Set the REGISTRY_TOKEN Actions secret with write:package access}"
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$HOST" -u "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Setup Docker buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Build the patched image
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.ubuntu24
+          build-args: |
+            WINE_FLAVOUR=patched
+            WINE_REF=${{ steps.pin.outputs.wine_ref }}
+            DOCKER_IMAGE_VERSION=${{ steps.tags.outputs.version }}
+            BUILD_REV=${{ github.sha }}
+            BUILD_NUMBER=${{ github.run_number }}
+          load: true
+          tags: bb-patched-test:local
+          platforms: linux/amd64
+          provenance: false
+
+      - name: Smoke test the patched image
+        run: ./.github/smoke-test.sh bb-patched-test:local
+
+      - name: Check the patched image carries the fork's Wine with its defaults
+        run: |
+          set -eu
+          docker run --rm --entrypoint /opt/wine/bin/wine bb-patched-test:local --version
+          docker run --rm --entrypoint sh bb-patched-test:local -c '
+            set -eu
+            grep -q "^variant=ubuntu24-patched" /etc/bb-build
+            grep -q "^applied wine-writability-fix switch" /opt/wine/share/bb64-patches
+            grep -aq WINE_SOCK_SEND_READY /opt/wine/bin/wineserver
+            test "$(readlink -f "$(command -v wineserver)")" = /opt/wine/bin/wineserver
+            test "$WINE_SOCK_SEND_READY" = 1 && test "$WINE_SERVICE_TOKEN" = 1 && test "$WINE_OFD_LOCKS" = 1
+            test "$WINE_HEAP_LFH_REUSE" = 1
+            test "$WINE_SOCK_FDWRITE_REARM" = 0 && test "$WINE_CASE_CACHE" = 0
+            test -z "$BACKBLAZE_VERSION"
+          '
+
+      - name: Push the patched image
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.ubuntu24
+          build-args: |
+            WINE_FLAVOUR=patched
+            WINE_REF=${{ steps.pin.outputs.wine_ref }}
+            DOCKER_IMAGE_VERSION=${{ steps.tags.outputs.version }}
+            BUILD_REV=${{ github.sha }}
+            BUILD_NUMBER=${{ github.run_number }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-to: type=inline
+          provenance: false
