@@ -122,9 +122,12 @@
                 "skipped",
                 "licence",
                 "renewal",
-                "lostlock"
+                "lostlock",
+                "scanstop",
+                "nolist",
+                "scanlock"
               ],
-              "description": "What the warning is about. lostlock: every backup pass aborts at the transmit step because the client cannot see its four-hour lock, seen with client 10.0.3.1075 under Wine."
+              "description": "What the warning is about. lostlock: every backup pass aborts at the transmit step because the client cannot see its four-hour lock, seen with client 10.0.3.1075 under Wine. nolist: a ticked drive has never finished a scan, so nothing on it uploads. scanlock: the scanner lost its lock and exited, so its scan starts over."
             },
             "text": {
               "type": "string"
@@ -315,6 +318,27 @@
                   "null"
                 ],
                 "description": "Bytes found so far"
+              },
+              "list_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Bytes written so far to the per-drive file lists being built (.future). Growing means the scan is moving even when the directory count is not."
+              },
+              "dir": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The directory the scanner last logged entering. null for a key without read:files."
+              },
+              "running_secs": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Seconds the current full scan process has been running."
               }
             }
           },

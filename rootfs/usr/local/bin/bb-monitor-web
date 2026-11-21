@@ -175,6 +175,10 @@ WARNING_KINDS = (
     ("scanstop",  "Scan stopped at a directory",
                   "The scanner cannot open a directory, so that disk's file list ends there and files "
                   "after it are not backed up. bb-doctor names the directories.", "scanstop", False),
+    ("nolist",    "Drive never finished a scan",
+                  "A ticked drive has no finished file list, so nothing on it uploads.", None, False),
+    ("scanlock",  "Scanner losing its lock",
+                  "A scan ended early because it lost its lock, so it starts over.", None, False),
     ("stale",     "No completed backup",
                   "No pass has completed within the limit set in the client's settings.", "stale", False),
     ("skipped",   "Files skipped", "The client has given up on files.", "skipped", False),
@@ -235,6 +239,14 @@ def client_health(pairs):
             seen.add(kind)
             out.append((kind, text))
     return out
+
+
+def dur_str(secs):
+    """3h12m, or None."""
+    if secs is None:
+        return None
+    h, m = divmod(int(secs) // 60, 60)
+    return "%dh%02dm" % (h, m) if h else "%dm" % m
 
 
 def health_entries(pairs):
@@ -332,7 +344,10 @@ def snapshot_to_json(d):
         "scan": ({"pct": round(d["scan"]["pct"], 1),
                    "dirs": "%d/%d" % (d["scan"]["dirs_done"], d["scan"]["dirs_total"]),
                    "files": d["scan"]["files"],
-                   "size_str": human(d["scan"]["bytes"]) if d["scan"]["bytes"] else None}
+                   "size_str": human(d["scan"]["bytes"]) if d["scan"]["bytes"] else None,
+                   "list_str": human(d["scan"]["list_bytes"]) if d["scan"].get("list_bytes") else None,
+                   "dir": d["scan"].get("dir"),
+                   "running": dur_str(d["scan"].get("running_secs"))}
                   if d.get("scan") else None),
         "perf": d.get("perf"),
         "health": health_entries(d.get("health")),
@@ -2080,6 +2095,9 @@ function renderNotices(j){
       'go through. Nothing new is being backed up until it does. Sign in at backblaze.com and ' +
       'update the payment details on the account. The client picks it up on its own afterwards.';
     else if(h.kind === 'filecheck') extra = ' Run bb-doctor from the ' + tools + '.';
+    else if(h.kind === 'nolist' || h.kind === 'scanlock') extra = ' Leave the client window closed and the ' +
+      'container running until the scan finishes. Excluding folders of small regenerable files shortens it. ' +
+      'If the service keeps restarting, check the container memory limit.';
     else if(h.kind === 'stale') extra = ' The client has not finished a pass within the limit set in its settings.';
     else if(h.kind === 'lostlock') extra = ' Every pass aborts at the transmit step once its file list is built, ' +
       'and the next one a few minutes later does the same, while large files keep uploading through the other ' +
@@ -2764,7 +2782,9 @@ def api_v1_payload(d):
                    "eta_samples": b.get("eta_samples", 0)} if b else None,
         "scan": {"dirs_done": sc.get("dirs_done"), "dirs_total": sc.get("dirs_total"),
                  "pct": round(sc["pct"], 2) if sc.get("pct") is not None else None,
-                 "files": sc.get("files"), "bytes": sc.get("bytes")} if sc else None,
+                 "files": sc.get("files"), "bytes": sc.get("bytes"),
+                 "list_bytes": sc.get("list_bytes"), "dir": sc.get("dir"),
+                 "running_secs": sc.get("running_secs")} if sc else None,
         "health": health_entries(d.get("health")),
         "skipped_files": d.get("skipped"),
         # The counts above say how many were given up on, and this names them. It
@@ -2862,6 +2882,9 @@ def strip_file_names(payload):
     # names the file as clearly as the in-flight list does. The counts in
     # skipped_files stay: they say how much is not backed up without saying what.
     out["skipped_list"] = None
+    # The directory being scanned names the user's folders too.
+    if out.get("scan"):
+        out["scan"] = dict(out["scan"], dir=None)
     # The drive selection and the exclusion list are both lists of directories on
     # the user's share, and a directory names files as clearly as a full path
     # does. "d:\\photos\\" is not backed up says what is on the drive.
@@ -4053,7 +4076,10 @@ async function tick(){
         '<span class="fill good" style="width:'+d.scan.pct+'%"></span></div>' +
         '<div class="meta"><span>'+d.scan.pct.toFixed(0)+'%</span>' +
         '<span>'+esc(d.scan.dirs)+' directories</span>' +
-        '<span>'+esc((d.scan.files||0).toLocaleString())+' files found</span></div></div>'
+        '<span>'+esc((d.scan.files||0).toLocaleString())+' files found</span>' +
+        (d.scan.list_str ? '<span>file list '+esc(d.scan.list_str)+'</span>' : '') +
+        (d.scan.running ? '<span>running '+esc(d.scan.running)+'</span>' : '') + '</div>' +
+        (d.scan.dir ? '<div class="meta"><span>in '+esc(d.scan.dir)+'</span></div>' : '') + '</div>'
       : '';
     // The chunk strip is the compact multi-part view, so the setting governs it.
     var stripHtml = (compactParts && d.chunkmap) ? chunkStrip(d.chunkmap) : '';

@@ -17,13 +17,14 @@ Imported by path rather than installed as a package, since both callers live in
     sys.path.insert(0, "/usr/local/lib/bb-monitor")
     import bbdata
 """
-import calendar, html, ipaddress, json, os, re, socket, struct, time
+import calendar, glob, html, ipaddress, json, os, re, socket, struct, time
 from collections import deque
 
 # ---- config (identical to bb-monitor) ------------------------------------
 BZ = "/config/wine/dosdevices/c:/ProgramData/Backblaze/bzdata"
 LOGDIR = BZ + "/bzlogs/bztransmit"
 FLOGDIR = BZ + "/bzlogs/bzfilelist"
+SLOGDIR = BZ + "/bzlogs/bzserv"
 BZSTAT_TOTAL = BZ + "/bzreports/bzstat_totalbackup.xml"
 BZSTAT_REMAIN = BZ + "/bzreports/bzstat_remainingbackup.xml"
 TDIR = BZ + "/bzthread"
@@ -341,8 +342,11 @@ def scan_progress(live=None):
     # only while bzfilelist is running and the files are still being written to.
     if live is False:
         return None
-    fresh = max(_mtime(FLISTS + "/topdirs.xml.future"),
-                _mtime(FLISTS + "/filestats.xml.future"))
+    # topdirs is rewritten only between top-level directories, which on a share
+    # of millions of files can be hours apart, while the per-volume list grows.
+    lists = glob.glob(FLISTS + "/*_filelist.dat.future")
+    fresh = max([_mtime(FLISTS + "/topdirs.xml.future"),
+                 _mtime(FLISTS + "/filestats.xml.future")] + [_mtime(f) for f in lists])
     if not fresh or time.time() - fresh > SCAN_STALE:
         return None
     fut = read(FLISTS + "/topdirs.xml.future")
@@ -359,7 +363,67 @@ def scan_progress(live=None):
     return {"dirs_done": min(done, total), "dirs_total": total,
             "pct": (min(done, total) * 100.0 / total) if total else 0.0,
             "files": int(mf.group(1)) if mf else None,
-            "bytes": int(mb.group(1)) if mb else None}
+            "bytes": int(mb.group(1)) if mb else None,
+            "list_bytes": sum(_size(f) for f in lists),
+            "dir": scan_dir(),
+            "running_secs": scan_running_secs()}
+
+
+def scan_running_secs():
+    """Seconds the oldest full scan process has been running, or None. The
+    -pingdrives check every ten minutes is not a scan and is left out."""
+    try:
+        with open(PROC + "/uptime") as fh:
+            up = float(fh.read().split()[0])
+        hz = os.sysconf("SC_CLK_TCK")
+        pids = [p for p in os.listdir(PROC) if p.isdigit()]
+    except (OSError, ValueError):
+        return None
+    best = None
+    for p in pids:
+        try:
+            with open(os.path.join(PROC, p, "cmdline"), "rb") as fh:
+                cmd = fh.read().decode("utf-8", "replace")
+            if "bzfilelist" not in cmd or "-pingdrives" in cmd:
+                continue
+            with open(os.path.join(PROC, p, "stat")) as fh:
+                start = int(fh.read().rsplit(")", 1)[1].split()[19]) / hz
+        except (OSError, ValueError, IndexError):
+            continue
+        secs = int(up - start)
+        best = secs if best is None else max(best, secs)
+    return best
+
+
+# bzserv logs this every few seconds for a ticked drive whose scan has never
+# finished, so its file list was never swapped in and nothing on it uploads.
+_NOLIST = re.compile(r"could not find file for selected drive: ([A-Za-z]):\\")
+# The scanner refreshes its lock as it goes. Losing it (another scan took it,
+# or bzserv was restarted under it) ends the scan, and the next starts over.
+SCAN_LOCK_LOST = "lost hour lock and could not grab it again, exiting"
+
+
+def never_listed(text=None, has_list=None):
+    """Upper-case letters of ticked drives without a finished file list."""
+    if text is None:
+        text = _newest_log_tail(SLOGDIR, 64 * 1024)
+    if has_list is None:
+        has_list = lambda l: bool(glob.glob("%s/*_%s____filelist.dat" % (FLISTS, l.lower())))
+    return sorted({l.upper() for l in _NOLIST.findall(text) if not has_list(l)})
+
+
+def scan_lock_losses(text=None):
+    """How many scans in the newest scan log ended by losing their lock."""
+    return (_scan_log_tail() if text is None else text).count(SCAN_LOCK_LOST)
+
+
+_SCANDIR = re.compile(r"about_to_scanDir=(.*?), futureFilename=")
+
+
+def scan_dir(text=None):
+    """The directory the scanner last logged it was entering, or None."""
+    found = _SCANDIR.findall(_scan_log_tail() if text is None else text)
+    return found[-1] if found else None
 
 
 def measured_perf():
@@ -417,8 +481,12 @@ _SCANFAIL = re.compile(r"FindFirstFile_C failed, dirPat=(.*?)\\\*, GetLastError=
 
 
 def _scan_log_tail(limit=512 * 1024):
+    return _newest_log_tail(FLOGDIR, limit)
+
+
+def _newest_log_tail(logdir, limit):
     try:
-        fs = [os.path.join(FLOGDIR, f) for f in os.listdir(FLOGDIR) if f.endswith(".log")]
+        fs = [os.path.join(logdir, f) for f in os.listdir(logdir) if f.endswith(".log")]
         if not fs:
             return ""
         p = max(fs, key=os.path.getmtime)
@@ -487,6 +555,16 @@ def health(data=None):
         out.append(("scanstop", "The scanner cannot open %d director%s, so a disk's file list stops there and files "
                                 "after it are not backed up, and bb-doctor names them"
                                 % (len(stops), "y" if len(stops) == 1 else "ies")))
+    nl = never_listed()
+    if nl:
+        out.append(("nolist", "%s ha%s no finished file list, so nothing on %s uploads. A scan must run to "
+                              "the end, and a restart or a change in the client's settings starts it again"
+                              % (", ".join(l + ":" for l in nl), "s" if len(nl) == 1 else "ve",
+                                 "it" if len(nl) == 1 else "them")))
+    sl = scan_lock_losses()
+    if sl:
+        out.append(("scanlock", "The scanner lost its lock and exited %d time%s in today's scan log, "
+                                "so its scan starts over" % (sl, "" if sl == 1 else "s")))
     lost = lost_lock()
     if lost:
         out.append(("lostlock", "The client lost its four-hour lock %d times since a pass last got "
@@ -1048,6 +1126,13 @@ def unesc(t):
     "Mike Judge&apos;s" and an ampersand as "&amp;". Anything pulled out of an
     attribute goes through here before it reaches a screen."""
     return html.unescape(t) if t else t
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def _mtime(path):

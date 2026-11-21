@@ -733,6 +733,16 @@ ok(bbdata.scan_stops(_scanlog, exists=lambda w: True) == [('D:\\Senary\\Beating 
    "scan_stops parses the path and the error from the scanner's lines, once per directory")
 ok(bbdata.scan_stops(_scanlog, exists=lambda w: w.startswith("G:")) == [("G:\\Music\\Father of All...", "3")],
    "a directory renamed since is a fix already made and is left out")
+ok(bbdata.scan_dir("x about_to_scanDir=D:\\Media\\Music\\, futureFilename=C:\\f.future") == "D:\\Media\\Music\\"
+   and bbdata.scan_dir("no scan lines") is None,
+   "scan_dir names the directory the scanner last entered")
+_srv = ("2026-11-21 06:58:37.814 1112 - ERROR: BzUiUtil::GetVecOf_SelForBackup_PerVolumeGuidFileList - failed could not "
+        "find file for selected drive: D:\\, vGuid=v001c, fileName=C:\\x\n")
+ok(bbdata.never_listed(_srv, has_list=lambda l: False) == ["D"], "never_listed names a ticked drive with no file list")
+ok(bbdata.never_listed(_srv, has_list=lambda l: True) == [], "and not once its list exists")
+ok(bbdata.scan_lock_losses("x - ERROR: RefreshGlobalThreeHourLock_ExitIfFail - processId= 1396 lost hour lock and could "
+                           "not grab it again, exiting!! startDirIn=D:\\A\n") == 1
+   and bbdata.scan_lock_losses("") == 0, "scan_lock_losses counts scans that exited on a lost lock")
 _slt = bbdata._scan_log_tail
 bbdata._scan_log_tail = lambda limit=0: _scanlog
 _isd = bbdata._win_isdir
