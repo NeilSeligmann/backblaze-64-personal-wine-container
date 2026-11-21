@@ -1,27 +1,17 @@
 name: Docker Build and Push
 
-# Scope concurrency per ref so a release-tag publish never queues behind (or gets
-# cancelled by) a main-branch build. PR builds cancel superseded runs to save CI.
-# Main and tag publishes are never cancelled mid-push.
+# This fork builds one image: the beta, from main, published as :beta.
+# The stable matrix and :latest-patched are not built. A publish is never
+# cancelled mid-push.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 on:
-  schedule:
-    # Weekly, Mondays at 04:23 UTC. A day-of-month step ('*/7') fires on the 1st,
-    # 8th, 15th, 22nd and 29th, so the gap over a month boundary is two or three
-    # days and February skips the 29th entirely, which is not the weekly cadence
-    # the beta job below describes.
-    - cron: '23 4 * * 1'
   push:
     branches: [ main ]
-    tags:
-      - 'v*'
     paths-ignore:
       - README.md
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -30,7 +20,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/backblaze-personal-wine
+  # Registry paths must be lower case, and this owner name is not.
+  IMAGE_NAME: neilseligmann/backblaze-personal-wine
 
 jobs:
   # Everything that can be checked without building an image. This job exists for
@@ -77,153 +68,6 @@ jobs:
       - name: Test the web interface, API and notifications
         run: python3 tests/test-beta.py
 
-  build:
-    needs: tests
-    runs-on: ubuntu-latest
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-    strategy:
-      matrix:
-        # ubuntu24 is the default (oldest supported LTS). The shared :latest/:main/
-        # version tags track it for stability. ubuntu26 ships as :ubuntu26 for early
-        # validation before it becomes the default. When 24.04's support ends, drop
-        # its entry here and let the default fall through to the next-oldest LTS.
-        dockerfile: [ubuntu24, ubuntu26]
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      # No QEMU step: every build here is platforms: linux/amd64, which is the
-      # runner's architecture, and emulation is only needed to build for
-      # another one. There is no linux/arm64 image because the client is a 64-bit
-      # Windows binary under Wine. The README explains why that is not a matrix entry.
-      # Docker Hub limits anonymous pulls per address, and GitHub's runners share
-      # addresses, so builds failed on 429s (9 Oct 2026). Signed in, the pulls
-      # (the BuildKit image, the Ubuntu and jlesage bases) count against this
-      # account instead. Skipped when the secrets are not set, such as on a pull
-      # request from a fork.
-      - name: Log into Docker Hub
-        if: env.DOCKERHUB_USERNAME != ''
-        # A sign-in that fails (Docker Hub unreachable from the runner) falls back
-        # to anonymous pulls rather than stopping the build.
-        continue-on-error: true
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Google's Docker Hub mirror first, Docker Hub only for what it lacks. The
-      # runners' own route to Docker Hub has failed with 429s, 500s and timeouts
-      # (9 Oct 2026), while the mirror carries BuildKit, both Ubuntu builder
-      # images and the 24.04 jlesage base. The 26.04 jlesage base is not on it
-      # yet, so that one still comes from Docker Hub.
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
-        with:
-          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["mirror.gcr.io"]
-
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
-      - name: Log into registry ${{ env.REGISTRY }}
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # Each variant always gets its own :ubuntuNN tag. The shared, unsuffixed
-          # tags (:latest, :main, the version tag) belong to the DEFAULT variant
-          # only - the oldest supported LTS (ubuntu24) - so they stay stable and the
-          # two matrix jobs never clobber each other's tags. :latest only moves on a
-          # release-tag push. The newer LTS is reachable via :ubuntu26 (and
-          # :<version>-ubuntu26 on releases) for early validation.
-          tags: |
-            type=raw,value=${{ matrix.dockerfile }}
-            type=ref,event=tag,enable=${{ matrix.dockerfile == 'ubuntu24' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') && matrix.dockerfile == 'ubuntu24' }}
-            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' && matrix.dockerfile == 'ubuntu24' }}
-            type=ref,event=tag,suffix=-ubuntu26,enable=${{ matrix.dockerfile == 'ubuntu26' }}
-
-      # Set up cache
-      - name: Setup Docker build cache
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5.1.0
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ matrix.dockerfile }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-${{ matrix.dockerfile }}-
-
-      # Build the image locally first so it can be started and checked before any
-      # push. A successful build does not show that the container comes up. Base
-      # image updates and startup script changes have broken first boot while
-      # building cleanly.
-      - name: Build Docker image for testing
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
-        with:
-          context: .
-          file: ./Dockerfile.${{ matrix.dockerfile }}
-          build-args: |
-            BUILD_REV=${{ github.sha }}
-            BUILD_NUMBER=${{ github.run_number }}
-          load: true
-          tags: bb-smoketest:${{ matrix.dockerfile }}
-          platforms: linux/amd64
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
-
-      - name: Smoke test the built image
-        run: ./.github/smoke-test.sh bb-smoketest:${{ matrix.dockerfile }}
-
-      # The stable images must never carry the patched Wine. They install
-      # winehq-stable from apt and reference nothing in patches/, so today this
-      # holds by construction - this step keeps it holding. The beta's Wine
-      # workaround diverges from Windows on purpose and is beta-only. A stable
-      # image that picked it up would be shipping that divergence to users who
-      # never opted into it.
-      - name: Assert the stable image carries unpatched Wine
-        run: |
-          set -eu
-          docker run --rm --entrypoint sh bb-smoketest:${{ matrix.dockerfile }} -c '
-            ws="$(readlink -f "$(command -v wineserver)")"
-            if grep -qa sock_stream_send_ready "$ws"; then
-              echo "FAIL: $ws contains the beta Wine patch; it must stay beta-only" >&2
-              exit 1
-            fi
-            echo "OK: $ws is unpatched"
-          '
-
-      # Push only once the smoke test has passed (and never on a pull request).
-      # The layers are already in the cache the test build populated, so this step
-      # assembles and pushes rather than rebuilding.
-      - name: Build and push Docker image
-        id: build-and-push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
-        with:
-          context: .
-          file: ./Dockerfile.${{ matrix.dockerfile }}
-          build-args: |
-            DOCKER_IMAGE_VERSION=${{ steps.meta.outputs.version }}
-            BUILD_REV=${{ github.sha }}
-            BUILD_NUMBER=${{ github.run_number }}
-          push: ${{ github.event_name != 'pull_request' }}
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
-
   # The beta image: Ubuntu 26.04 with Wine built from source and the upload-speed
   # patch applied. Compiling Wine takes much longer than the stable images, so this
   # runs on the weekly schedule and on demand rather than on every push. The build
@@ -235,7 +79,6 @@ jobs:
   # list overwrite :latest for every user.
   beta:
     needs: tests
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -384,167 +227,3 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:beta
           cache-from: type=local,src=/tmp/.buildx-cache-beta
           cache-to: type=local,dest=/tmp/.buildx-cache-beta,mode=max
-
-  # :latest-patched. The stable container (Dockerfile.ubuntu24) on the fork's
-  # Wine instead of WineHQ's, built with WINE_FLAVOUR=patched from the same
-  # patches/build-wine.sh the beta uses. The fixes are on and the performance
-  # and experimental patches off.
-  #
-  # It does not follow the beta. The Wine and the patch set are pinned in
-  # patches/promoted and move only when the beta is promoted at a stable
-  # release, so this job builds from that pin, not from patches/ as it stands.
-  # It publishes on release tags only (latest-patched and <version>-patched),
-  # as the stable images do. Run by hand, it builds and smoke-tests the pinned
-  # image without publishing, for checking a promotion before tagging. The
-  # guard below fails the job rather than let a tag without the -patched suffix
-  # overwrite a WineHQ tag.
-  patched:
-    needs: tests
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          # The whole history, so the pinned patch set can be checked out by tag
-          # or commit.
-          fetch-depth: 0
-
-      # The pin is read as data, never sourced, and each value is checked before
-      # it reaches git or the build.
-      - name: Use the promoted Wine and patch set
-        id: pin
-        run: |
-          set -eu
-          ref="$(sed -n 's/^WINE_REF=//p' patches/promoted | head -1)"
-          from="$(sed -n 's/^PATCHES_FROM=//p' patches/promoted | head -1)"
-          printf '%s' "$ref" | grep -Eq '^[A-Za-z0-9._/-]+$' || { echo "patches/promoted: bad WINE_REF '$ref'" >&2; exit 1; }
-          printf '%s' "$from" | grep -Eq '^[A-Za-z0-9._/-]+$' || { echo "patches/promoted: bad PATCHES_FROM '$from'" >&2; exit 1; }
-          if [ "$from" != this ]; then
-            git rev-parse --verify --quiet "${from}^{commit}" >/dev/null \
-              || { echo "patches/promoted: PATCHES_FROM=$from is not a tag or commit here" >&2; exit 1; }
-            rm -rf patches
-            git checkout "$from" -- patches
-            echo "patches/ taken from $from"
-          fi
-          echo "Building :latest-patched from Wine $ref"
-          echo "wine_ref=$ref" >> "$GITHUB_OUTPUT"
-
-      # Docker Hub limits anonymous pulls per address, and GitHub's runners share
-      # addresses, so builds failed on 429s (9 Oct 2026). Signed in, the pulls
-      # (the BuildKit image, the Ubuntu and jlesage bases) count against this
-      # account instead. Skipped when the secrets are not set, such as on a pull
-      # request from a fork.
-      - name: Log into Docker Hub
-        if: env.DOCKERHUB_USERNAME != ''
-        # A sign-in that fails (Docker Hub unreachable from the runner) falls back
-        # to anonymous pulls rather than stopping the build.
-        continue-on-error: true
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Google's Docker Hub mirror first, Docker Hub only for what it lacks. The
-      # runners' own route to Docker Hub has failed with 429s, 500s and timeouts
-      # (9 Oct 2026), while the mirror carries BuildKit, both Ubuntu builder
-      # images and the 24.04 jlesage base. The 26.04 jlesage base is not on it
-      # yet, so that one still comes from Docker Hub.
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
-        with:
-          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["mirror.gcr.io"]
-
-      - name: Log into registry ${{ env.REGISTRY }}
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Work out the tags
-        id: tags
-        run: |
-          set -eu
-          img="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
-            ver="${GITHUB_REF#refs/tags/}"
-            tags="$img:latest-patched,$img:${ver}-patched"
-          else
-            # Run by hand: built and tested, never published.
-            ver="dev"
-            tags=""
-          fi
-          for t in $(echo "$tags" | tr ',' ' '); do
-            case "$t" in *-patched) ;; *) echo "refusing to publish $t: not a -patched tag" >&2; exit 1 ;; esac
-          done
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Docker build cache
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25  # v5.1.0
-        with:
-          path: /tmp/.buildx-cache-patched
-          key: ${{ runner.os }}-buildx-patched-${{ hashFiles('Dockerfile.ubuntu24', 'patches/*') }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-patched-
-
-      - name: Build the patched image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
-        with:
-          context: .
-          file: ./Dockerfile.ubuntu24
-          build-args: |
-            WINE_FLAVOUR=patched
-            WINE_REF=${{ steps.pin.outputs.wine_ref }}
-            DOCKER_IMAGE_VERSION=${{ steps.tags.outputs.version }}
-            BUILD_REV=${{ github.sha }}
-            BUILD_NUMBER=${{ github.run_number }}
-          load: true
-          tags: bb-patched-test:local
-          platforms: linux/amd64
-          cache-from: type=local,src=/tmp/.buildx-cache-patched
-          cache-to: type=local,dest=/tmp/.buildx-cache-patched,mode=max
-
-      - name: Smoke test the patched image
-        run: ./.github/smoke-test.sh bb-patched-test:local
-
-      - name: Check the patched image carries the fork's Wine with its defaults
-        run: |
-          set -eu
-          docker run --rm --entrypoint /opt/wine/bin/wine bb-patched-test:local --version
-          docker run --rm --entrypoint sh bb-patched-test:local -c '
-            set -eu
-            grep -q "^variant=ubuntu24-patched" /etc/bb-build
-            grep -q "^applied wine-writability-fix switch" /opt/wine/share/bb64-patches
-            grep -aq WINE_SOCK_SEND_READY /opt/wine/bin/wineserver
-            test "$(readlink -f "$(command -v wineserver)")" = /opt/wine/bin/wineserver
-            test "$WINE_SOCK_SEND_READY" = 1 && test "$WINE_SERVICE_TOKEN" = 1 && test "$WINE_OFD_LOCKS" = 1
-            test "$WINE_HEAP_LFH_REUSE" = 1
-            test "$WINE_SOCK_FDWRITE_REARM" = 0 && test "$WINE_CASE_CACHE" = 0
-            test -z "$BACKBLAZE_VERSION"
-          '
-
-      - name: Push the patched image
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
-        with:
-          context: .
-          file: ./Dockerfile.ubuntu24
-          build-args: |
-            WINE_FLAVOUR=patched
-            WINE_REF=${{ steps.pin.outputs.wine_ref }}
-            DOCKER_IMAGE_VERSION=${{ steps.tags.outputs.version }}
-            BUILD_REV=${{ github.sha }}
-            BUILD_NUMBER=${{ github.run_number }}
-          push: true
-          platforms: linux/amd64
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=local,src=/tmp/.buildx-cache-patched
-          cache-to: type=local,dest=/tmp/.buildx-cache-patched,mode=max
